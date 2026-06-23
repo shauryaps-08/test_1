@@ -1,12 +1,6 @@
 # ============================================================
 # GitHub Actions CI Workflow for Verilog RTL Verification
 # ============================================================
-# Triggers on push/PR to main and develop branches.
-# Steps: Lint → Compile → Simulate → (optional) Formal Lint
-# Tools used:
-#   - Verilator  (lint + compile + simulation)
-#   - iverilog   (alternative compile + simulate)
-# ============================================================
 
 name: Verilog RTL CI
 
@@ -29,23 +23,22 @@ on:
       - '**.sv'
       - '**.vh'
 
-# Cancel any in-progress run for the same branch on new push
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   # ------------------------------------------------------------
-  # JOB 0: Discover RTL files (shared across jobs via output)
-  # Searches the ENTIRE repo root — no hardcoded folder assumed
+  # JOB 0: Discover RTL files + auto-detect top module name
   # ------------------------------------------------------------
   discover:
     name: Discover RTL Files
     runs-on: ubuntu-latest
 
     outputs:
-      rtl_files: ${{ steps.find.outputs.rtl_files }}
-      tb_files:  ${{ steps.find.outputs.tb_files }}
+      rtl_files:  ${{ steps.find.outputs.rtl_files }}
+      tb_files:   ${{ steps.find.outputs.tb_files }}
+      top_module: ${{ steps.find.outputs.top_module }}
 
     steps:
       - name: Checkout repository
@@ -54,39 +47,84 @@ jobs:
       - name: List repository structure (debug)
         run: find . -not -path './.git/*' | sort
 
-      - name: Find .v / .sv files
+      - name: Find RTL/TB files and detect top module
         id: find
         run: |
-          # ── RTL files: everything that is NOT inside tb/ or testbench/ dirs
+          # ── Testbench files: inside tb/ or testbench/, or named tb_*.v
+          TB=$(find . \
+                 -not -path './.git/*' \
+                 \( -path './tb/*' -o -path './testbench/*' -o -name "tb_*.v" -o -name "tb_*.sv" \) \
+                 \( -name "*.v" -o -name "*.sv" \) \
+               | sort | tr '\n' ' ')
+
+          # ── RTL files: everything else (excluding tb dirs and git)
           RTL=$(find . \
                   -not -path './.git/*' \
                   -not -path './tb/*' \
                   -not -path './testbench/*' \
+                  -not -name "tb_*.v" \
+                  -not -name "tb_*.sv" \
                   \( -name "*.v" -o -name "*.sv" \) \
                 | sort | tr '\n' ' ')
 
-          # ── Testbench files: inside tb/ or testbench/, or named tb_*.v
-          TB=$(find . \
-                 -not -path './.git/*' \
-                 \( -path './tb/*' -o -path './testbench/*' -o -name "tb_*.v" \) \
-                 \( -name "*.v" -o -name "*.sv" \) \
-               | sort | tr '\n' ' ')
-
-          echo "RTL files  : $RTL"
-          echo "TB  files  : $TB"
+          echo "RTL files : $RTL"
+          echo "TB  files : $TB"
 
           if [ -z "$RTL" ]; then
-            echo "::error::No .v or .sv RTL files found anywhere in the repo."
+            echo "::error::No RTL .v/.sv files found in the repo."
             exit 1
           fi
 
-          # Expose as job outputs
-          echo "rtl_files=$RTL" >> $GITHUB_OUTPUT
-          echo "tb_files=$TB"   >> $GITHUB_OUTPUT
+          # ── Auto-detect top module:
+          #    Parse all RTL files for 'module <name>' declarations.
+          #    The top module is the one whose name is NOT instantiated
+          #    inside any other module (i.e. it appears as a declaration
+          #    but never as an instance call in another file).
+          #
+          #    Simple heuristic for single-file projects: just grab the
+          #    first module name found. For multi-file: pick the module
+          #    that is never referenced as an instance elsewhere.
+
+          # Extract all declared module names
+          ALL_MODULES=$(grep -rh --include="*.v" --include="*.sv" \
+                          -E '^\s*module\s+\w+' . \
+                        | grep -v '\.git' \
+                        | sed -E 's/^\s*module\s+(\w+).*/\1/' \
+                        | sort -u)
+
+          echo "All declared modules: $ALL_MODULES"
+
+          TOP_MODULE=""
+          for MOD in $ALL_MODULES; do
+            # Check if this module is instantiated anywhere
+            # Instantiation pattern: <ModuleName> <instance_name> (
+            INSTANCES=$(grep -rh --include="*.v" --include="*.sv" \
+                          -E "^\s*${MOD}\s+\w+" . \
+                        | grep -v "module\s*${MOD}" \
+                        | grep -v '\.git' \
+                        | wc -l)
+            echo "  Module '$MOD' instantiated $INSTANCES time(s) in other files"
+            if [ "$INSTANCES" -eq 0 ]; then
+              TOP_MODULE=$MOD
+              # Don't break — last non-instantiated module wins
+              # (handles cases where tb_ modules are also non-instantiated)
+            fi
+          done
+
+          # If heuristic fails, fall back to first declared module
+          if [ -z "$TOP_MODULE" ]; then
+            TOP_MODULE=$(echo "$ALL_MODULES" | head -1)
+            echo "::warning::Could not auto-detect top module; using '$TOP_MODULE' as fallback."
+          fi
+
+          echo "Detected top module: $TOP_MODULE"
+
+          echo "rtl_files=$RTL"    >> $GITHUB_OUTPUT
+          echo "tb_files=$TB"      >> $GITHUB_OUTPUT
+          echo "top_module=$TOP_MODULE" >> $GITHUB_OUTPUT
 
   # ------------------------------------------------------------
   # JOB 1: Lint with Verilator
-  # Catches syntax errors, width mismatches, unused signals, etc.
   # ------------------------------------------------------------
   lint:
     name: Lint (Verilator)
@@ -107,22 +145,20 @@ jobs:
 
       - name: Run Verilator lint
         run: |
-          # --------------------------------------------------------
-          # CUSTOMISE: replace 'your_top_module' with your actual
-          # top-level module name (e.g. alu, uart_tx, soc_top …)
-          # --------------------------------------------------------
+          echo "Top module : ${{ needs.discover.outputs.top_module }}"
+          echo "RTL files  : ${{ needs.discover.outputs.rtl_files }}"
           verilator --lint-only \
             --Wall \
+            --Wno-DECLFILENAME \
             --Wno-fatal \
-            --top-module your_top_module \
+            --top-module ${{ needs.discover.outputs.top_module }} \
             ${{ needs.discover.outputs.rtl_files }}
-        # Flags:
-        #   --Wall      → enable all warnings
-        #   --Wno-fatal → warnings are warnings, not errors (remove to be strict)
+        # --Wno-DECLFILENAME  → suppresses the "filename≠module name" warning
+        # --Wno-fatal         → warnings don't abort the run
+        # Remove --Wno-fatal to treat ALL warnings as errors (strict mode)
 
   # ------------------------------------------------------------
-  # JOB 2: Compile & Simulate with Icarus Verilog (iverilog)
-  # Runs the testbench and checks for $finish / exit code
+  # JOB 2: Compile & Simulate with Icarus Verilog
   # ------------------------------------------------------------
   simulate:
     name: Compile & Simulate (iverilog)
@@ -138,24 +174,18 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y iverilog
 
-      - name: Print iverilog version
-        run: iverilog -V
-
       - name: Compile RTL + testbench
         run: |
-          # If no separate TB files exist, iverilog will still compile RTL-only
           TB="${{ needs.discover.outputs.tb_files }}"
-          iverilog -g2012 \
-            -o sim.out \
-            ${{ needs.discover.outputs.rtl_files }} \
-            $TB
+          RTL="${{ needs.discover.outputs.rtl_files }}"
+          echo "Compiling RTL: $RTL"
+          echo "With TB      : $TB"
+          iverilog -g2012 -Wall -o sim.out $RTL $TB
 
       - name: Run simulation
-        run: |
-          # vvp exits non-zero if the testbench calls $fatal or errors out
-          vvp sim.out
+        run: vvp sim.out
 
-      - name: Upload waveform dump on failure
+      - name: Upload waveform on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -164,20 +194,23 @@ jobs:
           retention-days: 7
 
   # ------------------------------------------------------------
-  # JOB 3: Results summary
+  # JOB 3: CI Summary
   # ------------------------------------------------------------
   summary:
     name: CI Summary
     runs-on: ubuntu-latest
-    needs: [lint, simulate]
+    needs: [discover, lint, simulate]
     if: always()
 
     steps:
-      - name: Write job summary
+      - name: Write summary
         run: |
           echo "## Verilog RTL CI Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Auto-detected top module:** \`${{ needs.discover.outputs.top_module }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Discover RTL Files  | ${{ needs.discover.outputs.top_module != '' && '✅ passed' || '❌ failed' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Lint (Verilator)    | ${{ needs.lint.result }} |"     >> $GITHUB_STEP_SUMMARY
           echo "| Simulate (iverilog) | ${{ needs.simulate.result }} |" >> $GITHUB_STEP_SUMMARY
