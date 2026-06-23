@@ -13,7 +13,7 @@
         if (rst)
             out <= 1'b0;
         else
-            out <= (state[2] & ~state[1] & state[0]) | (state[1] & ~state[0] & in);         
+            out <= (state[2] & ~state[1] & state[0]) | (state[1] & ~state[0] & in)        
     end
 endmodule
  
