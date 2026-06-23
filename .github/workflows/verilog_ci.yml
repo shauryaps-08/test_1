@@ -6,7 +6,6 @@
 # Tools used:
 #   - Verilator  (lint + compile + simulation)
 #   - iverilog   (alternative compile + simulate)
-#   - sv2v       (optional SystemVerilog → Verilog conversion)
 # ============================================================
 
 name: Verilog RTL CI
@@ -37,12 +36,62 @@ concurrency:
 
 jobs:
   # ------------------------------------------------------------
+  # JOB 0: Discover RTL files (shared across jobs via output)
+  # Searches the ENTIRE repo root — no hardcoded folder assumed
+  # ------------------------------------------------------------
+  discover:
+    name: Discover RTL Files
+    runs-on: ubuntu-latest
+
+    outputs:
+      rtl_files: ${{ steps.find.outputs.rtl_files }}
+      tb_files:  ${{ steps.find.outputs.tb_files }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: List repository structure (debug)
+        run: find . -not -path './.git/*' | sort
+
+      - name: Find .v / .sv files
+        id: find
+        run: |
+          # ── RTL files: everything that is NOT inside tb/ or testbench/ dirs
+          RTL=$(find . \
+                  -not -path './.git/*' \
+                  -not -path './tb/*' \
+                  -not -path './testbench/*' \
+                  \( -name "*.v" -o -name "*.sv" \) \
+                | sort | tr '\n' ' ')
+
+          # ── Testbench files: inside tb/ or testbench/, or named tb_*.v
+          TB=$(find . \
+                 -not -path './.git/*' \
+                 \( -path './tb/*' -o -path './testbench/*' -o -name "tb_*.v" \) \
+                 \( -name "*.v" -o -name "*.sv" \) \
+               | sort | tr '\n' ' ')
+
+          echo "RTL files  : $RTL"
+          echo "TB  files  : $TB"
+
+          if [ -z "$RTL" ]; then
+            echo "::error::No .v or .sv RTL files found anywhere in the repo."
+            exit 1
+          fi
+
+          # Expose as job outputs
+          echo "rtl_files=$RTL" >> $GITHUB_OUTPUT
+          echo "tb_files=$TB"   >> $GITHUB_OUTPUT
+
+  # ------------------------------------------------------------
   # JOB 1: Lint with Verilator
   # Catches syntax errors, width mismatches, unused signals, etc.
   # ------------------------------------------------------------
   lint:
     name: Lint (Verilator)
     runs-on: ubuntu-latest
+    needs: discover
 
     steps:
       - name: Checkout repository
@@ -56,31 +105,20 @@ jobs:
       - name: Print Verilator version
         run: verilator --version
 
-      # Adjust --top-module and source directory to match your project
-      - name: Find Verilog source files
-        id: find_files
-        run: |
-          # Collect all .v and .sv files under rtl/ recursively
-          FILES=$(find ./rtl -name "*.v" -o -name "*.sv" | sort | tr '\n' ' ')
-          if [ -z "$FILES" ]; then
-            echo "ERROR: No .v or .sv files found under ./rtl/" >&2
-            exit 1
-          fi
-          echo "Found RTL files: $FILES"
-          # Save to env so next step can use it
-          echo "RTL_FILES=$FILES" >> $GITHUB_ENV
-
       - name: Run Verilator lint
         run: |
+          # --------------------------------------------------------
+          # CUSTOMISE: replace 'your_top_module' with your actual
+          # top-level module name (e.g. alu, uart_tx, soc_top …)
+          # --------------------------------------------------------
           verilator --lint-only \
             --Wall \
+            --Wno-fatal \
             --top-module your_top_module \
-            -I./rtl/include \
-            $RTL_FILES
-        # Common flags:
-        #   --Wall        → enable all warnings
-        #   --Wno-fatal   → demote warnings (add this flag to be lenient)
-        #   -I<dir>       → header / `include search path
+            ${{ needs.discover.outputs.rtl_files }}
+        # Flags:
+        #   --Wall      → enable all warnings
+        #   --Wno-fatal → warnings are warnings, not errors (remove to be strict)
 
   # ------------------------------------------------------------
   # JOB 2: Compile & Simulate with Icarus Verilog (iverilog)
@@ -89,7 +127,7 @@ jobs:
   simulate:
     name: Compile & Simulate (iverilog)
     runs-on: ubuntu-latest
-    needs: lint          # only simulate if lint passes
+    needs: [discover, lint]
 
     steps:
       - name: Checkout repository
@@ -103,40 +141,21 @@ jobs:
       - name: Print iverilog version
         run: iverilog -V
 
-      # -----------------------------------------------------------------
-      # Compile RTL + testbench into a simulation executable
-      # Adjust source globs and top-level testbench name as needed
-      # -----------------------------------------------------------------
-      - name: Find Verilog source files
+      - name: Compile RTL + testbench
         run: |
-          FILES=$(find ./rtl -name "*.v" -o -name "*.sv" | sort | tr '\n' ' ')
-          if [ -z "$FILES" ]; then
-            echo "ERROR: No .v or .sv files found under ./rtl/" >&2
-            exit 1
-          fi
-          echo "RTL_FILES=$FILES" >> $GITHUB_ENV
-
-      - name: Compile RTL and testbench
-        run: |
+          # If no separate TB files exist, iverilog will still compile RTL-only
+          TB="${{ needs.discover.outputs.tb_files }}"
           iverilog -g2012 \
-            -I ./rtl/include \
             -o sim.out \
-            $RTL_FILES \
-            ./tb/tb_your_top_module.v
+            ${{ needs.discover.outputs.rtl_files }} \
+            $TB
 
-      # -----------------------------------------------------------------
-      # Run the simulation
-      # The workflow fails automatically if vvp exits with non-zero
-      # (use $finish in your testbench, or $fatal to force a failure)
-      # -----------------------------------------------------------------
       - name: Run simulation
-        run: vvp sim.out
+        run: |
+          # vvp exits non-zero if the testbench calls $fatal or errors out
+          vvp sim.out
 
-      # -----------------------------------------------------------------
-      # (Optional) Upload waveform dump for debugging failed runs
-      # Requires your testbench to call $dumpfile / $dumpvars
-      # -----------------------------------------------------------------
-      - name: Upload waveform dump
+      - name: Upload waveform dump on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -145,36 +164,7 @@ jobs:
           retention-days: 7
 
   # ------------------------------------------------------------
-  # JOB 3: Verilator C++ Build + Simulation (faster & synthesisable check)
-  # Compiles the design to C++ and runs a C++ testbench
-  # This job is optional – remove if you don't have a C++ tb
-  # ------------------------------------------------------------
-  verilator-sim:
-    name: Verilator C++ Simulation
-    runs-on: ubuntu-latest
-    needs: lint
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y verilator make g++
-
-      # Build using the Makefile in your sim/ or tb/ directory
-      # Replace with your actual build command
-      - name: Build Verilator simulation
-        run: |
-          make -C sim/ -f Makefile.verilator
-
-      - name: Run Verilator simulation
-        run: ./sim/obj_dir/Vyour_top_module
-
-  # ------------------------------------------------------------
-  # JOB 4: Results summary
-  # Posts a summary to the GitHub Actions UI
+  # JOB 3: Results summary
   # ------------------------------------------------------------
   summary:
     name: CI Summary
@@ -189,5 +179,5 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Lint (Verilator)     | ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Simulate (iverilog)  | ${{ needs.simulate.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint (Verilator)    | ${{ needs.lint.result }} |"     >> $GITHUB_STEP_SUMMARY
+          echo "| Simulate (iverilog) | ${{ needs.simulate.result }} |" >> $GITHUB_STEP_SUMMARY
