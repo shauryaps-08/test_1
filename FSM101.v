@@ -15,7 +15,7 @@
         else
             out <= (state[2] & ~state[1] & state[0]) | (state[1] & ~state[0] & in);         
     end
- 
+ //hi
 endmodule
  
 module mealy_101_detector (input wire clk, input wire rst, input wire in, output wire out );
