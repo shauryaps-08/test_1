@@ -4,7 +4,7 @@ module mux_4_to_1 (
     output reg out           // Output
 );
 
-    always(in or sel) begin
+    always@(in or sel) begin
         case (sel)
             2'b00: out = in[0];
             2'b01: out = in[1];
