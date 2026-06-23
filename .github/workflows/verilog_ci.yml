@@ -56,18 +56,31 @@ jobs:
       - name: Print Verilator version
         run: verilator --version
 
-      # Adjust --top-module and file paths to match your project
+      # Adjust --top-module and source directory to match your project
+      - name: Find Verilog source files
+        id: find_files
+        run: |
+          # Collect all .v and .sv files under rtl/ recursively
+          FILES=$(find ./rtl -name "*.v" -o -name "*.sv" | sort | tr '\n' ' ')
+          if [ -z "$FILES" ]; then
+            echo "ERROR: No .v or .sv files found under ./rtl/" >&2
+            exit 1
+          fi
+          echo "Found RTL files: $FILES"
+          # Save to env so next step can use it
+          echo "RTL_FILES=$FILES" >> $GITHUB_ENV
+
       - name: Run Verilator lint
         run: |
           verilator --lint-only \
             --Wall \
             --top-module your_top_module \
             -I./rtl/include \
-            ./rtl/*.v
+            $RTL_FILES
         # Common flags:
         #   --Wall        → enable all warnings
-        #   --Wno-fatal   → treat warnings as warnings, not errors (remove to be strict)
-        #   -I<dir>       → include search path for `include / headers
+        #   --Wno-fatal   → demote warnings (add this flag to be lenient)
+        #   -I<dir>       → header / `include search path
 
   # ------------------------------------------------------------
   # JOB 2: Compile & Simulate with Icarus Verilog (iverilog)
@@ -94,12 +107,21 @@ jobs:
       # Compile RTL + testbench into a simulation executable
       # Adjust source globs and top-level testbench name as needed
       # -----------------------------------------------------------------
+      - name: Find Verilog source files
+        run: |
+          FILES=$(find ./rtl -name "*.v" -o -name "*.sv" | sort | tr '\n' ' ')
+          if [ -z "$FILES" ]; then
+            echo "ERROR: No .v or .sv files found under ./rtl/" >&2
+            exit 1
+          fi
+          echo "RTL_FILES=$FILES" >> $GITHUB_ENV
+
       - name: Compile RTL and testbench
         run: |
           iverilog -g2012 \
             -I ./rtl/include \
             -o sim.out \
-            ./rtl/*.v \
+            $RTL_FILES \
             ./tb/tb_your_top_module.v
 
       # -----------------------------------------------------------------
